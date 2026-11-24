@@ -51,13 +51,18 @@ __global__ void persistent_scheduler(
     TaskQueue* queue,
     int* completed_count
 ) {
+    // Reserve dynamic shared memory to control block residency.
+    extern __shared__ unsigned char residency_smem[];
+
+    (void)residency_smem;
+
     if (threadIdx.x != 0) {
         return;
     }
 
     while (atomicAdd(completed_count, 0) < num_tasks) {
 
-        // Stop all workers if watchdog detects a hang
+        // Stop all workers if watchdog detects a hang.
         if (atomicAdd(&queue->watchdog_triggered, 0)) {
             return;
         }
@@ -91,11 +96,11 @@ __global__ void persistent_scheduler(
 
         task->start_time = get_global_time();
 
-        // Simulate task execution
+        // Simulate task execution.
         unsigned long long start = clock64();
 
         while (clock64() - start < task->duration) {
-            // Simulated work
+            // Simulated work.
         }
 
         task->end_time = get_global_time();
@@ -104,7 +109,7 @@ __global__ void persistent_scheduler(
 
         atomicExch(&task->state, TASK_DONE);
 
-        // Release dependent tasks
+        // Release dependent tasks.
         for (int i = 0; i < task->dependent_count; i++) {
             int dependent_id = task->dependents[i];
 
