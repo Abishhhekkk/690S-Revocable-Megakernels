@@ -24,6 +24,7 @@ __global__ void initialize_scheduler(
         queue->head = 0;
         queue->tail = 0;
         queue->lock = 0;
+	queue->overflow = 0;
 
         queue->start_time = get_global_time();
         queue->watchdog_triggered = 0;

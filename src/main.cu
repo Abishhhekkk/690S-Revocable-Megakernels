@@ -277,6 +277,9 @@ int main() {
     printf("\nWatchdog: %s\n",
            host_queue.watchdog_triggered ? "TRIGGERED" : "OK");
 
+    printf("Queue overflow: %s\n",
+       	   host_queue.overflow ? "YES" : "NO");
+    
     CUDA_CHECK(cudaMemcpy(
         host_tasks,
         device_tasks,
