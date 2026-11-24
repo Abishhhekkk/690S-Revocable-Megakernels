@@ -3,6 +3,7 @@
 
 #include "task.cuh"
 #include "task_queue.cuh"
+#include "task_record.cuh"
 
 #define WATCHDOG_TIMEOUT_NS 5000000000ULL
 
@@ -97,7 +98,9 @@ __global__ void persistent_scheduler(
 
         atomicAdd(&task->execution_count, 1);
 
-        task->start_time = get_global_time();
+        unsigned long long t_start = get_global_time();
+        task->start_time = t_start;
+        uint32_t log_slot = log_task_begin((uint32_t)task_id, t_start);  // no-op unless ENABLE_TASK_LOG
 
         // Simulate task execution.
         unsigned long long start = clock64();
@@ -106,7 +109,9 @@ __global__ void persistent_scheduler(
             // Simulated work.
         }
 
-        task->end_time = get_global_time();
+        unsigned long long t_end = get_global_time();
+        task->end_time = t_end;
+        log_task_end(log_slot, t_end);  // before dependents are released
 
 	// Record successful scheduler progress.
 	atomicExch(

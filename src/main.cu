@@ -1,6 +1,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <vector>
 #include <cuda_runtime.h>
 
 #include "task.cuh"
@@ -99,6 +101,26 @@ int main() {
         sizeof(host_tasks),
         cudaMemcpyHostToDevice
     ));
+
+#ifdef ENABLE_TASK_LOG
+    // ---- Part B1: per-task record log (see include/task_record.cuh) ----
+    const uint32_t LOG_CAPACITY = 4096;
+    TaskRecord* device_records = nullptr;
+    TaskLog* device_log = nullptr;
+
+    CUDA_CHECK(cudaMalloc(&device_records, LOG_CAPACITY * sizeof(TaskRecord)));
+    CUDA_CHECK(cudaMemset(device_records, 0, LOG_CAPACITY * sizeof(TaskRecord)));
+    CUDA_CHECK(cudaMalloc(&device_log, sizeof(TaskLog)));
+
+    TaskLog init_log = {};
+    init_log.capacity  = LOG_CAPACITY;
+    init_log.launch_id = 0;   // main kernel; bump before every relaunch/helper launch
+    init_log.step      = 0;   // toy kernel has a single step
+    init_log.records   = device_records;
+    CUDA_CHECK(cudaMemcpy(device_log, &init_log, sizeof(TaskLog),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpyToSymbol(g_task_log, &device_log, sizeof(TaskLog*)));
+#endif
 
     // =========================================================
     // 3. INITIALIZE SCHEDULER
@@ -287,6 +309,61 @@ int main() {
         cudaMemcpyDeviceToHost
     ));
 
+#ifdef ENABLE_TASK_LOG
+    {
+        // Dump records + task graph for tools/checker.py.
+        TaskLog final_log;
+        CUDA_CHECK(cudaMemcpy(&final_log, device_log, sizeof(TaskLog),
+                              cudaMemcpyDeviceToHost));
+
+        uint32_t n = final_log.count < final_log.capacity ? final_log.count
+                                                          : final_log.capacity;
+        if (final_log.count > final_log.capacity) {
+            fprintf(stderr, "WARNING: task log overflowed (%u > %u records)\n",
+                    final_log.count, final_log.capacity);
+        }
+
+        std::vector<TaskRecord> recs(n);
+        if (n > 0) {
+            CUDA_CHECK(cudaMemcpy(recs.data(), device_records,
+                                  n * sizeof(TaskRecord),
+                                  cudaMemcpyDeviceToHost));
+        }
+
+        FILE* fb = fopen("task_log.bin", "wb");
+        if (fb) {
+            fwrite(recs.data(), sizeof(TaskRecord), n, fb);
+            fclose(fb);
+        }
+
+        // dependencies are the inverse of the `dependents` lists
+        std::vector<std::vector<int>> deps(NUM_TASKS);
+        for (int i = 0; i < NUM_TASKS; i++) {
+            for (int j = 0; j < host_tasks[i].dependent_count; j++) {
+                deps[host_tasks[i].dependents[j]].push_back(i);
+            }
+        }
+
+        FILE* fg = fopen("task_graph.json", "w");
+        if (fg) {
+            fprintf(fg, "{\n  \"num_steps\": 1,\n  \"cross_step\": \"none\",\n");
+            fprintf(fg, "  \"log_count\": %u,\n  \"log_capacity\": %u,\n",
+                    final_log.count, final_log.capacity);
+            fprintf(fg, "  \"tasks\": [\n");
+            for (int i = 0; i < NUM_TASKS; i++) {
+                fprintf(fg, "    {\"id\": %d, \"deps\": [", i);
+                for (size_t k = 0; k < deps[i].size(); k++) {
+                    fprintf(fg, "%s%d", k ? ", " : "", deps[i][k]);
+                }
+                fprintf(fg, "]}%s\n", i + 1 < NUM_TASKS ? "," : "");
+            }
+            fprintf(fg, "  ]\n}\n");
+            fclose(fg);
+        }
+        printf("Wrote task_log.bin (%u records) and task_graph.json\n", n);
+    }
+#endif
+
     // =========================================================
     // 10. VALIDATE EXECUTION
     // =========================================================
@@ -329,6 +406,10 @@ int main() {
     CUDA_CHECK(cudaFree(device_tasks));
     CUDA_CHECK(cudaFree(device_queue));
     CUDA_CHECK(cudaFree(device_completed));
+#ifdef ENABLE_TASK_LOG
+    CUDA_CHECK(cudaFree(device_records));
+    CUDA_CHECK(cudaFree(device_log));
+#endif
 
     return (completed == NUM_TASKS && exactly_once)
         ? EXIT_SUCCESS : EXIT_FAILURE;
