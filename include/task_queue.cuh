@@ -21,7 +21,7 @@ struct TaskQueue {
     int overflow;
 
     // Watchdog information.
-    unsigned long long start_time;
+    unsigned long long last_progress_time;
     int watchdog_triggered;
 };
 

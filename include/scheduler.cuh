@@ -26,7 +26,7 @@ __global__ void initialize_scheduler(
         queue->lock = 0;
 	queue->overflow = 0;
 
-        queue->start_time = get_global_time();
+        queue->last_progress_time = get_global_time();
         queue->watchdog_triggered = 0;
 
         *completed_count = 0;
@@ -68,13 +68,15 @@ __global__ void persistent_scheduler(
             return;
         }
 
-        unsigned long long elapsed =
-            get_global_time() - queue->start_time;
+        unsigned long long now = get_global_time();
 
-        if (elapsed > WATCHDOG_TIMEOUT_NS) {
-            atomicExch(&queue->watchdog_triggered, 1);
-            return;
-        }
+	unsigned long long last_progress =
+    		atomicAdd(&queue->last_progress_time, 0ULL);
+
+	if (now - last_progress > WATCHDOG_TIMEOUT_NS) {
+    		atomicExch(&queue->watchdog_triggered, 1);
+    		return;
+	}
 
         int task_id = dequeue(queue);
 
@@ -106,6 +108,11 @@ __global__ void persistent_scheduler(
 
         task->end_time = get_global_time();
 
+	// Record successful scheduler progress.
+	atomicExch(
+    		&queue->last_progress_time,
+    		get_global_time()
+	);
         __threadfence();
 
         atomicExch(&task->state, TASK_DONE);
