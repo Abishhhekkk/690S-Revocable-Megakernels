@@ -1,0 +1,64 @@
+{
+ "yield_mode": "task",
+ "yields_requested": 5,
+ "yields_done": 5,
+ "gap_ms": 250.0,
+ "pause_ms": 20.0,
+ "steps": [
+  511,
+  511,
+  511,
+  511,
+  511,
+  511,
+  511,
+  511
+ ],
+ "events": [
+  {
+   "i": 0,
+   "yield_ms": 0.1745109912008047,
+   "checkpoint": true,
+   "resume_call_ms": 0.2283800859004259,
+   "t_since_launch_ms": 250.2040551044047
+  },
+  {
+   "i": 1,
+   "yield_ms": 0.08150679059326649,
+   "checkpoint": true,
+   "resume_call_ms": 0.16966485418379307,
+   "t_since_launch_ms": 520.7717511802912
+  },
+  {
+   "i": 2,
+   "yield_ms": 0.07811491377651691,
+   "checkpoint": true,
+   "resume_call_ms": 0.16099982894957066,
+   "t_since_launch_ms": 791.1757261026651
+  },
+  {
+   "i": 3,
+   "yield_ms": 0.09270617738366127,
+   "checkpoint": true,
+   "resume_call_ms": 0.20907609723508358,
+   "t_since_launch_ms": 1061.5644180215895
+  },
+  {
+   "i": 4,
+   "yield_ms": 0.08116010576486588,
+   "checkpoint": true,
+   "resume_call_ms": 0.16650604084134102,
+   "t_since_launch_ms": 1332.0220520254225
+  },
+  {
+   "done_ms": 2076.1384461075068
+  }
+ ],
+ "yield_ms_p50": 0.08150679059326649,
+ "yield_ms_max": 0.1745109912008047,
+ "yield_ms_mean": 0.10159979574382305,
+ "yield_ms_p90": 0.1745109912008047,
+ "resume_call_ms_p50": 0.16966485418379307,
+ "resume_call_ms_max": 0.2283800859004259,
+ "all_checkpoints": true
+}

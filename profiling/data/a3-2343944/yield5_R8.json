@@ -1,0 +1,61 @@
+{
+ "yields_requested": 5,
+ "yields_done": 5,
+ "gap_ms": 250.0,
+ "pause_ms": 20.0,
+ "steps": [
+  511,
+  511,
+  511,
+  511,
+  511,
+  511,
+  511,
+  511
+ ],
+ "events": [
+  {
+   "i": 0,
+   "yield_ms": 1.8826909363269806,
+   "checkpoint": true,
+   "resume_call_ms": 0.08683186024427414,
+   "t_since_launch_ms": 250.59739802964032
+  },
+  {
+   "i": 1,
+   "yield_ms": 1.7189581412822008,
+   "checkpoint": true,
+   "resume_call_ms": 0.06105680949985981,
+   "t_since_launch_ms": 522.6971739903092
+  },
+  {
+   "i": 2,
+   "yield_ms": 2.166816033422947,
+   "checkpoint": true,
+   "resume_call_ms": 0.05749496631324291,
+   "t_since_launch_ms": 794.599442044273
+  },
+  {
+   "i": 3,
+   "yield_ms": 2.38623796030879,
+   "checkpoint": true,
+   "resume_call_ms": 0.054972944781184196,
+   "t_since_launch_ms": 1066.9454201124609
+  },
+  {
+   "i": 4,
+   "yield_ms": 2.373996190726757,
+   "checkpoint": true,
+   "resume_call_ms": 0.05529192276299,
+   "t_since_launch_ms": 1339.509495999664
+  },
+  {
+   "done_ms": 1945.538747124374
+  }
+ ],
+ "yield_ms_p50": 2.166816033422947,
+ "yield_ms_max": 2.38623796030879,
+ "resume_call_ms_p50": 0.05749496631324291,
+ "resume_call_ms_max": 0.08683186024427414,
+ "all_checkpoints": true
+}
