@@ -38,14 +38,23 @@
 // HOST-SIDE YIELD REQUEST
 // =============================================================
 
-void host_request_yield(SchedulerControl* control) {
+// The control block lives in device memory: the A100 has no host-native
+// atomics, so system-scope atomics on mapped host memory are not safe. The
+// host sets the flag with an async copy on a non-blocking stream, which runs
+// while the persistent kernel occupies the legacy default stream.
+void host_request_yield(SchedulerControl* device_control,
+                        cudaStream_t control_stream) {
 
     // Give GPU workers time to begin execution.
     std::this_thread::sleep_for(
         std::chrono::milliseconds(100)
     );
 
-    request_scheduler_yield(control);
+    static const int one = 1;
+    CUDA_CHECK(cudaMemcpyAsync(&device_control->yield_requested, &one,
+                               sizeof(int), cudaMemcpyHostToDevice,
+                               control_stream));
+    CUDA_CHECK(cudaStreamSynchronize(control_stream));
 
     printf("\nHOST: Yield requested!\n");
 }
@@ -83,37 +92,8 @@ int main() {
     // 2. CHECK REQUIRED HOST-GPU CAPABILITIES
     // =========================================================
 
-    int host_mapping_supported = 0;
-    int host_native_atomic_supported = 0;
-
-    CUDA_CHECK(cudaDeviceGetAttribute(
-        &host_mapping_supported,
-        cudaDevAttrCanMapHostMemory,
-        device
-    ));
-
-    CUDA_CHECK(cudaDeviceGetAttribute(
-        &host_native_atomic_supported,
-        cudaDevAttrHostNativeAtomicSupported,
-        device
-    ));
-
-    printf("\n========== A2 ATOMIC CAPABILITIES ==========\n");
-
-    printf("Mapped host memory: %s\n",
-           host_mapping_supported ? "SUPPORTED" : "NOT SUPPORTED");
-
-    printf("Host-native atomics: %s\n",
-           host_native_atomic_supported ? "SUPPORTED" : "NOT SUPPORTED");
-
-    if (!host_mapping_supported ||
-        !host_native_atomic_supported) {
-
-        fprintf(stderr,
-            "ERROR: Required host-GPU capabilities unavailable.\n");
-
-        return EXIT_FAILURE;
-    }
+    // (The control block is in device memory, so host-native atomics are
+    // not required; see host_request_yield.)
 
     // =========================================================
     // 3. CHECK COOPERATIVE LAUNCH SUPPORT
@@ -186,23 +166,17 @@ int main() {
     host_tasks[5].dependent_count = 0;
 
     // =========================================================
-    // 5. ALLOCATE MAPPED HOST CONTROL MEMORY
+    // 5. ALLOCATE DEVICE CONTROL MEMORY (+ host mirror)
     // =========================================================
 
-    SchedulerControl* host_control = nullptr;
+    SchedulerControl host_mirror{};
+    SchedulerControl* host_control = &host_mirror;   // read back after syncs
     SchedulerControl* device_control = nullptr;
+    cudaStream_t control_stream = nullptr;
 
-    CUDA_CHECK(cudaHostAlloc(
-        reinterpret_cast<void**>(&host_control),
-        sizeof(SchedulerControl),
-        cudaHostAllocMapped
-    ));
-
-    CUDA_CHECK(cudaHostGetDevicePointer(
-        reinterpret_cast<void**>(&device_control),
-        host_control,
-        0
-    ));
+    CUDA_CHECK(cudaMalloc(&device_control, sizeof(SchedulerControl)));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&control_stream,
+                                         cudaStreamNonBlocking));
 
     host_control->yield_requested = 0;
     host_control->status = SCHEDULER_IDLE;
@@ -211,8 +185,10 @@ int main() {
     host_control->resume_generation = 0;
     host_control->error_code = 0;
     host_control->yield_timestamp = 0;
+    CUDA_CHECK(cudaMemcpy(device_control, host_control,
+                          sizeof(SchedulerControl), cudaMemcpyHostToDevice));
 
-    printf("\nA2: Mapped scheduler control memory allocated.\n");
+    printf("\nA2: Device scheduler control memory allocated.\n");
 
     // =========================================================
     // 6. GPU MEMORY ALLOCATION
@@ -365,6 +341,8 @@ int main() {
     host_control->yield_requested = 0;
     host_control->status = SCHEDULER_RUNNING;
     host_control->resume_generation = 0;
+    CUDA_CHECK(cudaMemcpy(device_control, host_control,
+                          sizeof(SchedulerControl), cudaMemcpyHostToDevice));
 
     printf("\nA2: Worker coordination initialized.\n");
 
@@ -408,7 +386,8 @@ int main() {
 
     std::thread yield_thread(
         host_request_yield,
-        host_control
+        device_control,
+        control_stream
     );
 
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -416,6 +395,9 @@ int main() {
     yield_thread.join();
 
     printf("\nHOST: First GPU kernel terminated.\n");
+
+    CUDA_CHECK(cudaMemcpy(host_control, device_control,
+                          sizeof(SchedulerControl), cudaMemcpyDeviceToHost));
 
     // =========================================================
     // 14. CHECK YIELD RESULT
@@ -449,7 +431,8 @@ int main() {
         CUDA_CHECK(cudaFree(device_tasks));
         CUDA_CHECK(cudaFree(device_queue));
         CUDA_CHECK(cudaFree(device_completed));
-        CUDA_CHECK(cudaFreeHost(host_control));
+        CUDA_CHECK(cudaFree(device_control));
+        CUDA_CHECK(cudaStreamDestroy(control_stream));
 
         return EXIT_FAILURE;
     }
@@ -506,6 +489,9 @@ int main() {
     // =========================================================
     // 17. RETRIEVE FINAL SCHEDULER STATUS
     // =========================================================
+
+    CUDA_CHECK(cudaMemcpy(host_control, device_control,
+                          sizeof(SchedulerControl), cudaMemcpyDeviceToHost));
 
     final_status = get_scheduler_status(host_control);
 
@@ -664,7 +650,8 @@ int main() {
     CUDA_CHECK(cudaFree(device_queue));
     CUDA_CHECK(cudaFree(device_completed));
 
-    CUDA_CHECK(cudaFreeHost(host_control));
+    CUDA_CHECK(cudaFree(device_control));
+    CUDA_CHECK(cudaStreamDestroy(control_stream));
 #ifdef ENABLE_TASK_LOG
     CUDA_CHECK(cudaFree(device_records));
     CUDA_CHECK(cudaFree(device_log));
