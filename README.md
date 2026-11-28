@@ -61,6 +61,27 @@ The expected outcome is a cooperative revocation mechanism for megakernels that 
 
 The research aims to characterize the trade-off between scheduling responsiveness and background throughput, and determine when task-aware yielding can improve predictable LLM serving under competing workloads.
 
+## Repository layout
+
+| path | what |
+|---|---|
+| `include/`, `src/`, `tests/` | Toy persistent megakernel: cooperative scheduler, ring-buffer queue and watchdog (A1), yield/resume (A2), per-task log (B1) |
+| `tools/` | Independent correctness checker and tests (B1) |
+| `mpk/` | Our MPK changes as patches against upstream: A3 yield/resume, task-boundary yield, A100 fixes. `mpk/setup_mpk.sh` builds the patched tree |
+| `profiling/` | C2 MPK profiling report, A3 yield/resume tests and results on A100 |
+| `workload/` | C3 workload generator (urgent and background classes; Poisson, bursty, trace arrivals) |
+| `scripts/` | SLURM test scripts |
+
+## How to test (Unity, A100)
+
+```bash
+mkdir -p logs
+sbatch scripts/test_a100.sbatch              # toy megakernel with yield/resume + B1 checker
+mpk/setup_mpk.sh                             # patched MPK at ~/mirage-a3
+sbatch profiling/a3_yield_test.sbatch        # MPK yield/resume, bit-exact output check
+python workload/test_gen.py                  # workload generator tests (CPU)
+```
+
 ## References
 
 - Cheng et al., *MPK: A Compiler and Runtime for Mega-Kernelizing Tensor Programs*, OSDI 2026.
