@@ -1,0 +1,1584 @@
+diff --git a/include/mirage/persistent_kernel/persistent_kernel.cuh b/include/mirage/persistent_kernel/persistent_kernel.cuh
+index 873e064b..e6fcb96f 100644
+--- a/include/mirage/persistent_kernel/persistent_kernel.cuh
++++ b/include/mirage/persistent_kernel/persistent_kernel.cuh
+@@ -40,6 +40,7 @@
+ #endif
+ #endif
+ #include <map>
++#include <mutex>
+ #include <thread>
+ #include <unistd.h>
+ #include <vector>
+@@ -958,6 +959,36 @@ __device__ __forceinline__ void persistent_checker(RuntimeConfig config) {
+   // assert(blockDim.x >= 128);
+ }
+ 
++__device__ __forceinline__ int get_revocation_state(
++    RuntimeConfig const &config) {
++  if (config.revocation_control == nullptr) {
++    return static_cast<int>(RevocationState::RUNNING);
++  }
++  int state;
++  asm volatile("ld.acquire.gpu.s32 %0, [%1];"
++               : "=r"(state)
++               : "l"(&config.revocation_control->state)
++               : "memory");
++  return state;
++}
++
++__device__ __forceinline__ int increment_stopped_scheduler_count(int *count) {
++  int old_count;
++  asm volatile("atom.add.acq_rel.gpu.s32 %0, [%1], 1;"
++               : "=r"(old_count)
++               : "l"(count)
++               : "memory");
++  return old_count;
++}
++
++__device__ __forceinline__ void publish_revocation_state_device(int *state,
++                                                                 int value) {
++  asm volatile("st.release.gpu.s32 [%0], %1;"
++               :
++               : "l"(state), "r"(value)
++               : "memory");
++}
++
+ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
+   // Make sure overall smem usage here do not exceed 3KB
+   // last_task_pos: 2 * 8 = 16 B
+@@ -976,6 +1007,9 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
+   __shared__ int worker_queue_ids[2];
+   __shared__ size_t next_task_pos[2];
+   __shared__ size_t last_task_pos[2];
++  __shared__ int active_queue_idx;
++  __shared__ int should_exit_worker;
++  __shared__ unsigned long long batch_start_pos;
+ 
+ #ifdef MPK_ENABLE_PROFILING
+   PROFILER_CLOSURE_PARAMS_DECL;
+@@ -997,11 +1031,37 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
+   }
+ 
+   if (threadIdx.x == 0) {
+-    for (int i = 0; i < 2; i++) {
+-      next_task_pos[i] = 0;
+-    }
+-    for (int i = 0; i < 2; i++) {
+-      last_task_pos[i] = 0;
++    active_queue_idx = 0;
++    should_exit_worker = 0;
++    batch_start_pos = 0;
++
++    if (config.resume_mode && config.worker_checkpoints != nullptr) {
++      WorkerCheckpoint *checkpoint =
++          &config.worker_checkpoints[worker_id];
++      for (int i = 0; i < num_worker_queues; i++) {
++        next_task_pos[i] = checkpoint->consumed_task_pos[i];
++        last_task_pos[i] = ld_acquire_gpu_u64(
++            &config.worker_queue_last_ready_task_id[worker_queue_ids[i]]);
++      }
++      for (int i = num_worker_queues; i < 2; i++) {
++        next_task_pos[i] = 0;
++        last_task_pos[i] = 0;
++      }
++      active_queue_idx = checkpoint->active_queue_idx;
++    } else {
++      for (int i = 0; i < 2; i++) {
++        next_task_pos[i] = 0;
++        last_task_pos[i] = 0;
++      }
++      if (config.worker_checkpoints != nullptr) {
++        WorkerCheckpoint *checkpoint =
++            &config.worker_checkpoints[worker_id];
++        checkpoint->consumed_task_pos[0] = 0;
++        checkpoint->consumed_task_pos[1] = 0;
++        checkpoint->active_queue_idx = 0;
++        __threadfence();
++        checkpoint->acknowledged = 1;
++      }
+     }
+     // num_loaded_tasks = 0;
+   }
+@@ -1013,32 +1073,62 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
+   while (true) {
+     // fetch next task from a task queue if task_descs is empty
+     if (queue_pos == queue_len) {
+-      int queue_idx = 0;
+       if (threadIdx.x == 0) {
+-        while (next_task_pos[queue_idx] == last_task_pos[queue_idx]) {
+-          last_task_pos[queue_idx] =
+-              ld_acquire_gpu_u64(&config.worker_queue_last_ready_task_id
+-                                      [worker_queue_ids[queue_idx]]);
+-          if (next_task_pos[queue_idx] < last_task_pos[queue_idx]) {
++        if (config.worker_states != nullptr) {
++          atomicExch(&config.worker_states[worker_id],
++                     static_cast<int>(ParticipantState::IDLE));
++        }
++        while (true) {
++          bool found_task = false;
++          for (int i = 0; i < num_worker_queues; i++) {
++            last_task_pos[i] =
++                ld_acquire_gpu_u64(
++                    &config.worker_queue_last_ready_task_id[worker_queue_ids[i]]);
++            if (next_task_pos[i] < last_task_pos[i]) {
++              active_queue_idx = i;
++              found_task = true;
++              break;
++            }
++          }
++
++          if (found_task) {
++            if (config.worker_states != nullptr) {
++              atomicExch(&config.worker_states[worker_id],
++                         static_cast<int>(ParticipantState::ACTIVE));
++            }
++            break;
++          }
++
++          if (get_revocation_state(config) ==
++              static_cast<int>(RevocationState::SCHEDULERS_STOPPED)) {
++            should_exit_worker = 1;
+             break;
+-          } else {
+-            queue_idx =
+-                (queue_idx == num_worker_queues - 1) ? 0 : queue_idx + 1;
+           }
+-          // nanosleep to avoid overwhelming I/O
++
+           __nanosleep(10);
+         }
+-        assert(next_task_pos[queue_idx] + config.per_worker_queue_len >
+-               last_task_pos[queue_idx]);
++        if (!should_exit_worker) {
++          assert(next_task_pos[active_queue_idx] +
++                   config.per_worker_queue_len >
++               last_task_pos[active_queue_idx]);
++          batch_start_pos = next_task_pos[active_queue_idx];
++        }
+       }
+       __syncthreads();
++      if (should_exit_worker) {
++        if (threadIdx.x == 0 && config.worker_states != nullptr) {
++          atomicExch(&config.worker_states[worker_id],
++                     static_cast<int>(ParticipantState::STOPPED));
++        }
++        return;
++      }
+       int num_loaded_tasks =
+-          min((int)(last_task_pos[queue_idx] - next_task_pos[queue_idx]),
++          min((int)(last_task_pos[active_queue_idx] - next_task_pos[active_queue_idx]),
+               TASK_DESCS_BUFFER_LENGTH);
+       // Load task ids
+       if (threadIdx.x < num_loaded_tasks) {
+         task_ids[threadIdx.x] = ld_relaxed_gpu_u64(
+-            &worker_queues[queue_idx][(next_task_pos[queue_idx] + threadIdx.x) %
++            &worker_queues[active_queue_idx][(next_task_pos[active_queue_idx] + threadIdx.x) %
+                                       config.per_worker_queue_len]);
+       }
+       __syncthreads();
+@@ -1046,12 +1136,12 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
+ #ifdef MPK_ENABLE_VERBOSE
+         for (int i = 0; i < num_loaded_tasks; i++) {
+           printf(
+-              "[%d][FTCH] worker_id(%d) queue_idx(%d) next_task_pos(%llu, "
++              "[%d][FTCH] worker_id(%d) active_queue_idx(%d) next_task_pos(%llu, "
+               "%llu) last_task_pos(%llu, %llu) "
+               "task_id(%llu) task_type(%d) event_id(%llx) \n",
+               config.my_gpu_id,
+               worker_id,
+-              queue_idx,
++              active_queue_idx,
+               next_task_pos[0],
+               next_task_pos[1],
+               last_task_pos[0],
+@@ -1062,7 +1152,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
+                   .trigger_event);
+         }
+ #endif
+-        next_task_pos[queue_idx] += num_loaded_tasks;
++        next_task_pos[active_queue_idx] += num_loaded_tasks;
+       }
+       // Load task descs
+       static_assert(sizeof(TaskDesc) % 16 == 0);
+@@ -1252,6 +1342,18 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
+       }
+     }
+     queue_pos += 1;
++    __syncthreads();
++
++    if (threadIdx.x == 0 && config.worker_checkpoints != nullptr) {
++      WorkerCheckpoint *checkpoint =
++          &config.worker_checkpoints[worker_id];
++      checkpoint->consumed_task_pos[active_queue_idx] =
++          batch_start_pos + static_cast<unsigned long long>(queue_pos);
++      checkpoint->active_queue_idx = active_queue_idx;
++      __threadfence();
++      checkpoint->acknowledged = 1;
++    }
++    __syncthreads();
+   }
+ }
+ 
+@@ -1320,23 +1422,95 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
+            my_last_worker);
+ #endif
+     size_t cur_event_pos[2], last_event_pos[2];
+-    for (int i = 0; i < 2; i++) {
+-      cur_event_pos[i] = 0;
+-      last_event_pos[i] = 0;
++    size_t worker_queue_next_free_task_pos[MAX_WORKER_PER_SCHEDULER];
++    int next_worker = my_first_worker;
++    int queue_idx = 0;
++
++    SchedulerCheckpoint *checkpoint =
++        config.scheduler_checkpoints + sched_id;
++
++    if (config.resume_mode && checkpoint != nullptr) {
++      iteration_num = checkpoint->iteration_num;
++      next_worker = checkpoint->next_worker;
++      queue_idx = checkpoint->queue_idx;
++
++      for (int i = 0; i < num_sched_queues; i++) {
++        cur_event_pos[i] = checkpoint->cur_event_pos[i];
++        last_event_pos[i] = ld_acquire_gpu_u64(
++            &config.sched_queue_last_ready_event_id[sched_queue_ids[i]]);
++      }
++      for (int i = num_sched_queues; i < 2; i++) {
++        cur_event_pos[i] = 0;
++        last_event_pos[i] = 0;
++      }
++      for (int i = 0; i < MAX_WORKER_PER_SCHEDULER; i++) {
++        worker_queue_next_free_task_pos[i] =
++            config.scheduler_worker_queue_cursors[
++                sched_id * MAX_WORKER_PER_SCHEDULER + i];
++      }
++    } else {
++      for (int i = 0; i < 2; i++) {
++        cur_event_pos[i] = 0;
++        last_event_pos[i] = 0;
++      }
++      for (int i = 0; i < MAX_WORKER_PER_SCHEDULER; i++) {
++        worker_queue_next_free_task_pos[i] = 0;
++      }
+     }
+ 
+-    size_t worker_queue_next_free_task_pos[MAX_WORKER_PER_SCHEDULER];
++    // Publish a valid initial checkpoint before the scheduler can be revoked.
++    // This also covers a revocation requested immediately after launch.
++    for (int i = 0; i < 2; i++) {
++      checkpoint->cur_event_pos[i] = cur_event_pos[i];
++    }
++    checkpoint->iteration_num = iteration_num;
++    checkpoint->next_worker = next_worker;
++    checkpoint->queue_idx = queue_idx;
+     for (int i = 0; i < MAX_WORKER_PER_SCHEDULER; i++) {
+-      worker_queue_next_free_task_pos[i] = 0;
++      config.scheduler_worker_queue_cursors[
++          sched_id * MAX_WORKER_PER_SCHEDULER + i] =
++          worker_queue_next_free_task_pos[i];
+     }
++    __threadfence();
++    checkpoint->acknowledged = 1;
+ 
+-    // if (sched_id == 0) {
+-    //   worker_queue_next_free_task_pos[0] = 1;
+-    // }
+-    int next_worker = my_first_worker;
+-    int queue_idx = 0;
+     while (true) {
++      if (get_revocation_state(config) >=
++          static_cast<int>(RevocationState::REVOKE_REQUESTED)) {
++        for (int i = 0; i < 2; i++) {
++          checkpoint->cur_event_pos[i] = cur_event_pos[i];
++        }
++        checkpoint->iteration_num = iteration_num;
++        checkpoint->next_worker = next_worker;
++        checkpoint->queue_idx = queue_idx;
++        for (int i = 0; i < MAX_WORKER_PER_SCHEDULER; i++) {
++          config.scheduler_worker_queue_cursors[
++              sched_id * MAX_WORKER_PER_SCHEDULER + i] =
++              worker_queue_next_free_task_pos[i];
++        }
++        __threadfence();
++        checkpoint->acknowledged = 1;
++        if (config.scheduler_states != nullptr) {
++          atomicExch(&config.scheduler_states[sched_id],
++                     static_cast<int>(ParticipantState::STOPPED));
++        }
++        int stopped = increment_stopped_scheduler_count(
++            &config.revocation_control->schedulers_stopped);
++        int expected_schedulers = config.split_worker_scheduler
++                                      ? config.num_local_schedulers
++                                      : num_schedulers;
++        if (stopped + 1 == expected_schedulers) {
++          publish_revocation_state_device(
++              &config.revocation_control->state,
++              static_cast<int>(RevocationState::SCHEDULERS_STOPPED));
++        }
++        return;
++      }
+       while (cur_event_pos[queue_idx] == last_event_pos[queue_idx]) {
++        if (config.scheduler_states != nullptr) {
++          atomicExch(&config.scheduler_states[sched_id],
++                     static_cast<int>(ParticipantState::IDLE));
++        }
+         //__threadfence();
+         // last_event_id = config.sched_queue_last_ready_event_id[sched_id];
+         // last_event_id =
+@@ -1345,7 +1519,16 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
+             &config
+                  .sched_queue_last_ready_event_id[sched_queue_ids[queue_idx]]);
+ 
++        if (get_revocation_state(config) >=
++            static_cast<int>(RevocationState::REVOKE_REQUESTED)) {
++          break;
++        }
++
+         if (cur_event_pos[queue_idx] < last_event_pos[queue_idx]) {
++          if (config.scheduler_states != nullptr) {
++            atomicExch(&config.scheduler_states[sched_id],
++                       static_cast<int>(ParticipantState::ACTIVE));
++          }
+           break;
+         } else {
+           queue_idx = (queue_idx == num_sched_queues - 1) ? 0 : queue_idx + 1;
+@@ -1353,6 +1536,10 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
+         // nanosleep to avoid overwhelming I/O
+         __nanosleep(10);
+       }
++      if (get_revocation_state(config) >=
++          static_cast<int>(RevocationState::REVOKE_REQUESTED)) {
++        continue;
++      }
+       // Make sure the schedule queue is not overflow
+       assert(cur_event_pos[queue_idx] + config.per_sched_queue_len >
+              last_event_pos[queue_idx]);
+@@ -1409,6 +1596,10 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
+               compute_task_id(iteration_num + 1, 1 /*begin_task_graph*/));
+           // Use st.relaxed to make sure writes to worker_queues is visible to
+           // worker CTAs before we increase its last_ready_task_id
++              if (config.worker_states != nullptr) {
++                atomicExch(&config.worker_states[next_worker],
++                           static_cast<int>(ParticipantState::ACTIVE));
++              }
+           atom_add_release_gpu_u64(
+               &config.worker_queue_last_ready_task_id[next_worker], 1);
+ #ifdef MPK_ENABLE_VERBOSE
+@@ -1448,6 +1639,10 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
+                   compute_task_id(iteration_num, position_index));
+               // Use st.relaxed to make sure writes to worker_queues is visible
+               // to worker CTAs before we increase its last_ready_task_id
++                  if (config.worker_states != nullptr) {
++                    atomicExch(&config.worker_states[next_worker],
++                               static_cast<int>(ParticipantState::ACTIVE));
++                  }
+               atom_add_release_gpu_u64(
+                   &config.worker_queue_last_ready_task_id[next_worker], 1);
+ 
+@@ -1502,6 +1697,10 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
+               compute_task_id(iteration_num, i));
+           // Use st.relaxed to make sure writes to worker_queues is visible to
+           // worker CTAs before we increase its last_ready_task_id
++              if (config.worker_states != nullptr) {
++                atomicExch(&config.worker_states[next_worker],
++                           static_cast<int>(ParticipantState::ACTIVE));
++              }
+           atom_add_release_gpu_u64(
+               &config.worker_queue_last_ready_task_id[next_worker], 1);
+ 
+@@ -1522,6 +1721,21 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
+         }
+       }
+       cur_event_pos[queue_idx] += 1;
++
++      for (int i = 0; i < MAX_WORKER_PER_SCHEDULER; i++) {
++        config.scheduler_worker_queue_cursors[
++            sched_id * MAX_WORKER_PER_SCHEDULER + i] =
++            worker_queue_next_free_task_pos[i];
++      }
++      for (int i = 0; i < 2; i++) {
++        checkpoint->cur_event_pos[i] = cur_event_pos[i];
++      }
++      checkpoint->iteration_num = iteration_num;
++      checkpoint->next_worker = next_worker;
++      checkpoint->queue_idx = queue_idx;
++      __threadfence();
++      checkpoint->acknowledged = 1;
++
+     }
+   }
+ }
+@@ -1576,6 +1790,30 @@ static void
+                             std::map<std::string, void *> const &model_tensors);
+ 
+ static RuntimeConfig global_runtime_config;
++static cudaStream_t revocation_stream = nullptr;
++static int *host_revocation_state = nullptr;
++static std::mutex revocation_mutex;
++static bool revocation_requested = false;
++static bool persistent_kernel_running = false;
++static bool persistent_kernel_checkpoint_valid = false;
++
++static cudaError_t publish_revocation_state(int state) {
++  if (revocation_stream == nullptr || host_revocation_state == nullptr ||
++      global_runtime_config.revocation_control == nullptr) {
++    return cudaErrorInvalidResourceHandle;
++  }
++  *host_revocation_state = state;
++  cudaError_t err = cudaMemcpyAsync(
++      global_runtime_config.revocation_control,
++      host_revocation_state,
++      sizeof(int),
++      cudaMemcpyHostToDevice,
++      revocation_stream);
++  if (err != cudaSuccess) {
++    return err;
++  }
++  return cudaStreamSynchronize(revocation_stream);
++}
+ 
+ // Global model tensors map for runtime tensor lookup
+ static std::map<std::string, void *> global_model_tensors;
+@@ -1717,7 +1955,26 @@ extern "C" void
+   int num_schedulers = num_local_schedulers + num_remote_schedulers;
+ 
+   // Initialize nvshmem
+-  cudaSetDevice(my_rank);
++  cudaError_t init_err = cudaSetDevice(my_rank);
++  if (init_err != cudaSuccess) {
++    throw std::runtime_error(std::string("cudaSetDevice failed: ") +
++                             cudaGetErrorString(init_err));
++  }
++  init_err = cudaStreamCreateWithFlags(&revocation_stream,
++                                       cudaStreamNonBlocking);
++  if (init_err != cudaSuccess) {
++    throw std::runtime_error(std::string("Failed to create revocation stream: ") +
++                             cudaGetErrorString(init_err));
++  }
++  init_err = cudaHostAlloc(reinterpret_cast<void **>(&host_revocation_state),
++                           sizeof(int),
++                           cudaHostAllocPortable);
++  if (init_err != cudaSuccess) {
++    cudaStreamDestroy(revocation_stream);
++    revocation_stream = nullptr;
++    throw std::runtime_error(std::string("Failed to allocate revocation staging memory: ") +
++                             cudaGetErrorString(init_err));
++  }
+   // Increase printf FIFO to avoid losing debug messages from device.
+   cudaDeviceSetLimit(cudaLimitPrintfFifoSize, 128 * 1024 * 1024);
+ 
+@@ -1816,6 +2073,85 @@ extern "C" void
+ 
+   // Initialize worker queue last task id
+   // Each worker now maintains a local and a remote worker queue
++  // Allocate persistent revocation control state.
++  global_runtime_config.resume_mode = 0;
++  global_runtime_config.revocation_control =
++      gpu_malloc<RevocationControl>(sizeof(RevocationControl));
++  global_runtime_config.scheduler_checkpoints =
++      gpu_malloc<SchedulerCheckpoint>(
++          sizeof(SchedulerCheckpoint) * num_schedulers);
++  global_runtime_config.worker_checkpoints =
++      gpu_malloc<WorkerCheckpoint>(
++          sizeof(WorkerCheckpoint) * num_workers);
++  global_runtime_config.worker_states =
++      gpu_malloc<int>(sizeof(int) * num_workers);
++  global_runtime_config.scheduler_states =
++      gpu_malloc<int>(sizeof(int) * num_schedulers);
++  global_runtime_config.scheduler_worker_queue_cursors =
++      gpu_malloc<unsigned long long>(
++          sizeof(unsigned long long) * num_schedulers *
++          MAX_WORKER_PER_SCHEDULER);
++
++  cudaError_t scheduler_cursor_init_err =
++      cudaMemset(global_runtime_config.scheduler_worker_queue_cursors,
++                 0,
++                 sizeof(unsigned long long) * num_schedulers *
++                     MAX_WORKER_PER_SCHEDULER);
++  if (scheduler_cursor_init_err != cudaSuccess) {
++    throw std::runtime_error(
++        std::string("Failed to initialize scheduler cursors: ") +
++        cudaGetErrorString(scheduler_cursor_init_err));
++  }
++
++  cudaError_t worker_checkpoint_init_err =
++      cudaMemset(global_runtime_config.worker_checkpoints,
++                 0,
++                 sizeof(WorkerCheckpoint) * num_workers);
++  if (worker_checkpoint_init_err != cudaSuccess) {
++    throw std::runtime_error(
++        std::string("Failed to initialize worker checkpoints: ") +
++        cudaGetErrorString(worker_checkpoint_init_err));
++  }
++
++  cudaError_t worker_states_init_err =
++      cudaMemset(global_runtime_config.worker_states,
++                 static_cast<int>(ParticipantState::ACTIVE),
++                 sizeof(int) * num_workers);
++  if (worker_states_init_err != cudaSuccess) {
++    throw std::runtime_error(
++        std::string("Failed to initialize worker states: ") +
++        cudaGetErrorString(worker_states_init_err));
++  }
++
++  cudaError_t scheduler_states_init_err =
++      cudaMemset(global_runtime_config.scheduler_states,
++                 static_cast<int>(ParticipantState::ACTIVE),
++                 sizeof(int) * num_schedulers);
++  if (scheduler_states_init_err != cudaSuccess) {
++    throw std::runtime_error(
++        std::string("Failed to initialize scheduler states: ") +
++        cudaGetErrorString(scheduler_states_init_err));
++  }
++  cudaError_t checkpoint_init_err =
++      cudaMemset(global_runtime_config.scheduler_checkpoints,
++                 0,
++                 sizeof(SchedulerCheckpoint) * num_schedulers);
++  if (checkpoint_init_err != cudaSuccess) {
++    throw std::runtime_error(
++        std::string("Failed to initialize scheduler checkpoints: ") +
++        cudaGetErrorString(checkpoint_init_err));
++  }
++
++  cudaError_t revocation_init_err =
++      cudaMemset(global_runtime_config.revocation_control,
++                 0,
++                 sizeof(RevocationControl));
++  if (revocation_init_err != cudaSuccess) {
++    throw std::runtime_error(
++        std::string("Failed to initialize revocation control: ") +
++        cudaGetErrorString(revocation_init_err));
++  }
++
+   global_runtime_config.worker_queue_last_ready_task_id =
+       gpu_malloc<unsigned long long int>((num_workers * 2) *
+                                          sizeof(unsigned long long int));
+@@ -1956,13 +2292,14 @@ extern "C" void
+ 
+ // Entry point for C/C++
+ // TODO: change launch config
+-extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
++static cudaError_t launch_persistent_kernel_impl(cudaStream_t default_stream,
++                                                 bool resume) {
+   // int device;
+   // cudaGetDevice(&device);
+   // int sm_count;
+   // cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
+   //  Prepare next persistent kernel by resetting queue pointers
+-  {
++  if (!resume) {
+     int end_of_task_graph_event_pos = global_runtime_config.num_events - 1;
+     prepare_kernel<<<dim3(global_runtime_config.num_workers, 1, 1),
+                      dim3(128, 1, 1),
+@@ -1975,6 +2312,12 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
+ #ifdef USE_NVSHMEM
+     nvshmem_barrier_all();
+ #endif
++  } else {
++    cudaError_t event_err =
++        cudaEventRecord(global_runtime_config.prepare_done_event, default_stream);
++    if (event_err != cudaSuccess) {
++      return event_err;
++    }
+   }
+   int num_schedulers = global_runtime_config.num_local_schedulers +
+                        global_runtime_config.num_remote_schedulers;
+@@ -2038,26 +2381,211 @@ extern "C" void launch_persistent_kernel(cudaStream_t default_stream) {
+                         MAX_DYNAMIC_SHARED_MEMORY_SIZE /*smem*/>>>(
+         global_runtime_config);
+ #endif
+-    cudaError_t err = cudaDeviceSynchronize();
+-    if (err != cudaSuccess) {
+-      printf("CUDA kernel launch error: %s\n", cudaGetErrorString(err));
+-    }
+-    printf("Finished Launch Persistent Kernel\n");
++    printf("Finished Launching Persistent Kernel (Async)\n");
++  }
++  cudaError_t launch_err = cudaGetLastError();
++  if (launch_err == cudaSuccess) {
++    persistent_kernel_running = true;
++  }
++  return launch_err;
++}
++
++extern "C" cudaError_t launch_persistent_kernel(cudaStream_t default_stream) {
++  std::lock_guard<std::mutex> lock(revocation_mutex);
++  if (persistent_kernel_running || persistent_kernel_checkpoint_valid) {
++    return cudaErrorInvalidValue;
+   }
++  global_runtime_config.resume_mode = 0;
++  cudaError_t err = publish_revocation_state(
++      static_cast<int>(RevocationState::RUNNING));
++  if (err != cudaSuccess) {
++    return err;
++  }
++  revocation_requested = false;
++  return launch_persistent_kernel_impl(default_stream, false);
++}
++
++extern "C" cudaError_t resume_persistent_kernel(cudaStream_t default_stream) {
++  std::lock_guard<std::mutex> lock(revocation_mutex);
++#ifdef USE_NVSHMEM
++  int local_ready =
++      (!persistent_kernel_running && persistent_kernel_checkpoint_valid) ? 1 : 0;
++  int all_ready = 0;
++  if (MPI_Allreduce(&local_ready,
++                    &all_ready,
++                    1,
++                    MPI_INT,
++                    MPI_MIN,
++                    MPI_COMM_WORLD) != MPI_SUCCESS) {
++    return cudaErrorUnknown;
++  }
++  if (!all_ready) return cudaErrorInvalidValue;
++#else
++  if (persistent_kernel_running || !persistent_kernel_checkpoint_valid) {
++    return cudaErrorInvalidValue;
++  }
++#endif
++  cudaError_t err;
++  // Reset only the revocation counter; queue tails and checkpoints are the
++  // state that makes this a resume rather than a fresh launch.
++  *host_revocation_state = 0;
++  err = cudaMemcpyAsync(&global_runtime_config.revocation_control->schedulers_stopped,
++                        host_revocation_state,
++                        sizeof(int),
++                        cudaMemcpyHostToDevice,
++                        revocation_stream);
++  if (err != cudaSuccess) return err;
++  err = cudaStreamSynchronize(revocation_stream);
++  if (err != cudaSuccess) return err;
++  err = publish_revocation_state(static_cast<int>(RevocationState::RUNNING));
++  if (err != cudaSuccess) return err;
++  global_runtime_config.resume_mode = 1;
++  err = launch_persistent_kernel_impl(default_stream, true);
++  global_runtime_config.resume_mode = 0;
++  if (err == cudaSuccess) {
++    persistent_kernel_checkpoint_valid = false;
++    revocation_requested = false;
++  }
++  return err;
++}
++
++extern "C" cudaError_t request_persistent_kernel_revocation() {
++  std::lock_guard<std::mutex> lock(revocation_mutex);
++  if (global_runtime_config.revocation_control == nullptr) {
++    return cudaErrorInvalidResourceHandle;
++  }
++#ifdef USE_NVSHMEM
++  int local_running = persistent_kernel_running ? 1 : 0;
++  int all_running = 0;
++  if (MPI_Allreduce(&local_running,
++                    &all_running,
++                    1,
++                    MPI_INT,
++                    MPI_MIN,
++                    MPI_COMM_WORLD) != MPI_SUCCESS) {
++    return cudaErrorUnknown;
++  }
++  if (!all_running) return cudaErrorInvalidValue;
++#else
++  if (!persistent_kernel_running) {
++    return cudaErrorInvalidValue;
++  }
++#endif
++  if (revocation_requested) {
++    return cudaSuccess;
++  }
++  cudaError_t err = publish_revocation_state(
++      static_cast<int>(RevocationState::REVOKE_REQUESTED));
++  if (err == cudaSuccess) revocation_requested = true;
++  return err;
+ }
+ 
+ extern "C" cudaError_t wait_persistent_kernel() {
++  cudaError_t err;
++  int local_requested = 0;
++  int local_checkpoint = 0;
+   if (!global_runtime_config.split_worker_scheduler) {
++    err = cudaDeviceSynchronize();
++  } else {
++    cudaError_t scheduler_err =
++        cudaStreamSynchronize(global_runtime_config.scheduler_stream);
++    cudaError_t worker_err =
++        cudaStreamSynchronize(global_runtime_config.worker_stream);
++    err = scheduler_err != cudaSuccess ? scheduler_err : worker_err;
++  }
++  if (err != cudaSuccess) return err;
++  {
++    std::lock_guard<std::mutex> lock(revocation_mutex);
++    if (persistent_kernel_running) {
++      persistent_kernel_running = false;
++      if (revocation_requested) {
++        int state = static_cast<int>(RevocationState::RUNNING);
++        err = cudaMemcpy(&state,
++                         &global_runtime_config.revocation_control->state,
++                         sizeof(int),
++                         cudaMemcpyDeviceToHost);
++        if (err == cudaSuccess &&
++            state == static_cast<int>(RevocationState::SCHEDULERS_STOPPED)) {
++          persistent_kernel_checkpoint_valid = true;
++          err = publish_revocation_state(
++              static_cast<int>(RevocationState::REVOKED));
++        } else if (err == cudaSuccess) {
++          // Natural termination raced the revoke request, or a participant
++          // failed to acknowledge the drain. There is no resumable snapshot.
++          persistent_kernel_checkpoint_valid = false;
++        }
++      }
++    }
++    local_requested = revocation_requested ? 1 : 0;
++    local_checkpoint = persistent_kernel_checkpoint_valid ? 1 : 0;
++  }
++#ifdef USE_NVSHMEM
++  int local_error = err == cudaSuccess ? 0 : 1;
++  int any_error = 0;
++  int min_requested = 0, max_requested = 0;
++  int all_checkpoints = 0;
++  if (MPI_Allreduce(&local_error,
++                    &any_error,
++                    1,
++                    MPI_INT,
++                    MPI_MAX,
++                    MPI_COMM_WORLD) != MPI_SUCCESS ||
++      MPI_Allreduce(&local_requested,
++                    &min_requested,
++                    1,
++                    MPI_INT,
++                    MPI_MIN,
++                    MPI_COMM_WORLD) != MPI_SUCCESS ||
++      MPI_Allreduce(&local_requested,
++                    &max_requested,
++                    1,
++                    MPI_INT,
++                    MPI_MAX,
++                    MPI_COMM_WORLD) != MPI_SUCCESS ||
++      MPI_Allreduce(&local_checkpoint,
++                    &all_checkpoints,
++                    1,
++                    MPI_INT,
++                    MPI_MIN,
++                    MPI_COMM_WORLD) != MPI_SUCCESS) {
++    return cudaErrorUnknown;
++  }
++  if (any_error) return err == cudaSuccess ? cudaErrorUnknown : err;
++  if (min_requested != max_requested ||
++      (min_requested && !all_checkpoints)) {
++    std::lock_guard<std::mutex> lock(revocation_mutex);
++    persistent_kernel_checkpoint_valid = false;
++    revocation_requested = false;
+     return cudaSuccess;
+   }
+-  cudaError_t worker_err =
+-      cudaStreamSynchronize(global_runtime_config.worker_stream);
+-  cudaError_t scheduler_err =
+-      cudaStreamSynchronize(global_runtime_config.scheduler_stream);
+-  return worker_err != cudaSuccess ? worker_err : scheduler_err;
++  std::lock_guard<std::mutex> lock(revocation_mutex);
++  revocation_requested = false;
++#else
++  std::lock_guard<std::mutex> lock(revocation_mutex);
++  revocation_requested = false;
++#endif
++  return err;
++}
++
++extern "C" bool persistent_kernel_checkpoint_available() {
++  std::lock_guard<std::mutex> lock(revocation_mutex);
++  return persistent_kernel_checkpoint_valid;
+ }
+ 
+ extern "C" void finalize_persistent_kernel() {
++  gpu_free(global_runtime_config.scheduler_checkpoints);
++  global_runtime_config.scheduler_checkpoints = nullptr;
++  gpu_free(global_runtime_config.scheduler_worker_queue_cursors);
++  global_runtime_config.scheduler_worker_queue_cursors = nullptr;
++  gpu_free(global_runtime_config.worker_checkpoints);
++  global_runtime_config.worker_checkpoints = nullptr;
++  gpu_free(global_runtime_config.worker_states);
++  global_runtime_config.worker_states = nullptr;
++  gpu_free(global_runtime_config.scheduler_states);
++  global_runtime_config.scheduler_states = nullptr;
++
++  gpu_free(global_runtime_config.revocation_control);
++  global_runtime_config.revocation_control = nullptr;
+   gpu_free(global_runtime_config.worker_queue_last_ready_task_id);
+   gpu_free(global_runtime_config.sched_queue_last_ready_event_id);
+   gpu_free(global_runtime_config.sched_queue_next_free_event_id);
+@@ -2116,4 +2644,10 @@ extern "C" void finalize_persistent_kernel() {
+ #endif
+   cudaStreamDestroy(global_runtime_config.worker_stream);
+   cudaStreamDestroy(global_runtime_config.scheduler_stream);
++  if (revocation_stream != nullptr) cudaStreamDestroy(revocation_stream);
++  if (host_revocation_state != nullptr) cudaFreeHost(host_revocation_state);
++  revocation_stream = nullptr;
++  host_revocation_state = nullptr;
++  persistent_kernel_running = false;
++  persistent_kernel_checkpoint_valid = false;
+ }
+diff --git a/include/mirage/persistent_kernel/runtime_header.h b/include/mirage/persistent_kernel/runtime_header.h
+index 3d70f5a9..8fffe45d 100644
+--- a/include/mirage/persistent_kernel/runtime_header.h
++++ b/include/mirage/persistent_kernel/runtime_header.h
+@@ -409,7 +409,51 @@ struct alignas(16) TaskDesc {
+   FullTaskDesc::TaskMetadata task_metadata;
+ };
+ 
++enum class RevocationState : int {
++  RUNNING = 0,
++  REVOKE_REQUESTED = 1,
++  SCHEDULERS_STOPPED = 2,
++  REVOKED = 3
++};
++
++enum class ParticipantState : int {
++  ACTIVE = 0,
++  IDLE = 1,
++  DRAINED = 2,
++  STOPPED = 3
++};
++
++struct RevocationControl {
++  int state;
++  int schedulers_stopped;
++  int workers_stopped;
++  int resume_requested;
++  int drain_lock;
++};
++
++struct SchedulerCheckpoint {
++  unsigned long long cur_event_pos[2];
++  unsigned long long iteration_num;
++  int next_worker;
++  int queue_idx;
++  int acknowledged;
++};
++
++struct WorkerCheckpoint {
++  unsigned long long consumed_task_pos[2];
++  int active_queue_idx;
++  int acknowledged;
++};
++
+ struct RuntimeConfig {
++  RevocationControl *revocation_control;
++  SchedulerCheckpoint *scheduler_checkpoints;
++  WorkerCheckpoint *worker_checkpoints;
++  int *worker_states;
++  int *scheduler_states;
++  unsigned long long *scheduler_worker_queue_cursors;
++  int resume_mode;
++
+   int num_workers, num_local_schedulers, num_remote_schedulers, num_graphs;
+   int num_gpus, my_gpu_id;
+   int num_events;
+diff --git a/python/mirage/engine/launch_server.py b/python/mirage/engine/launch_server.py
+index 163601c7..65ba6258 100644
+--- a/python/mirage/engine/launch_server.py
++++ b/python/mirage/engine/launch_server.py
+@@ -3,9 +3,14 @@
+ Usage::
+ 
+     python -m mirage.engine.launch_server \\
+-        --model Qwen/Qwen3-8B \\
++        --model Qwen/Qwen3-1.7B \\
+         --max-num-batched-requests 4 \\
+         --port 8000
++
++Pause and resume mid-decode through the serving loop::
++
++    curl -X POST http://127.0.0.1:8000/admin/yield
++    curl -X POST http://127.0.0.1:8000/admin/resume
+ """
+ 
+ from __future__ import annotations
+@@ -113,6 +118,9 @@ async def _stream_bridge(
+ 
+ @app.post("/v1/chat/completions")
+ async def chat_completions(request: Request):
++    engine: LLMEngine = request.app.state.engine
++    if engine.is_yielded:
++        raise HTTPException(status_code=503, detail="MPK serving is yielded")
+     body = await _parse_json(request)
+     prompt = _extract_prompt(body.get("messages", []))
+     stream = body.get("stream", False)
+@@ -120,14 +128,13 @@ async def chat_completions(request: Request):
+ 
+     if stream:
+         return StreamingResponse(
+-            _stream_bridge(request.app.state.engine, prompt, timeout),
++            _stream_bridge(engine, prompt, timeout),
+             media_type="text/event-stream",
+         )
+     else:
+         loop = asyncio.get_running_loop()
+         result = await loop.run_in_executor(
+-            None, lambda: request.app.state.engine.submit(
+-                prompt, timeout=timeout),
++            None, lambda: engine.submit(prompt, timeout=timeout),
+         )
+         return {
+             "id": "chatcmpl-0",
+@@ -142,6 +149,9 @@ async def chat_completions(request: Request):
+ 
+ @app.post("/v1/completions")
+ async def completions(request: Request):
++    engine: LLMEngine = request.app.state.engine
++    if engine.is_yielded:
++        raise HTTPException(status_code=503, detail="MPK serving is yielded")
+     body = await _parse_json(request)
+     prompt = body.get("prompt", "")
+     stream = body.get("stream", False)
+@@ -149,14 +159,13 @@ async def completions(request: Request):
+ 
+     if stream:
+         return StreamingResponse(
+-            _stream_bridge(request.app.state.engine, prompt, timeout),
++            _stream_bridge(engine, prompt, timeout),
+             media_type="text/event-stream",
+         )
+     else:
+         loop = asyncio.get_running_loop()
+         result = await loop.run_in_executor(
+-            None, lambda: request.app.state.engine.submit(
+-                prompt, timeout=timeout),
++            None, lambda: engine.submit(prompt, timeout=timeout),
+         )
+         return {
+             "id": "cmpl-0",
+@@ -169,6 +178,40 @@ async def completions(request: Request):
+         }
+ 
+ 
++@app.post("/admin/yield")
++async def yield_kernel(request: Request):
++    """Drain MPK schedulers/workers and preserve active decode state."""
++    engine: LLMEngine = request.app.state.engine
++    if engine.model_runner.world_size > 1:
++        raise HTTPException(
++            status_code=409,
++            detail="Multi-rank MPK yield must be invoked collectively on every rank",
++        )
++    loop = asyncio.get_running_loop()
++    try:
++        await loop.run_in_executor(None, engine.yield_kernel)
++    except RuntimeError as exc:
++        raise HTTPException(status_code=409, detail=str(exc)) from exc
++    return {"status": "yielded"}
++
++
++@app.post("/admin/resume")
++async def resume_kernel(request: Request):
++    """Resume the serving kernel from its in-memory checkpoint."""
++    engine: LLMEngine = request.app.state.engine
++    if engine.model_runner.world_size > 1:
++        raise HTTPException(
++            status_code=409,
++            detail="Multi-rank MPK resume must be invoked collectively on every rank",
++        )
++    loop = asyncio.get_running_loop()
++    try:
++        await loop.run_in_executor(None, engine.resume)
++    except RuntimeError as exc:
++        raise HTTPException(status_code=409, detail=str(exc)) from exc
++    return {"status": "running"}
++
++
+ # ── CLI ───────────────────────────────────────────────────────────────────────
+ 
+ 
+diff --git a/python/mirage/engine/llm_engine.py b/python/mirage/engine/llm_engine.py
+index 2bc24a75..9ab71051 100644
+--- a/python/mirage/engine/llm_engine.py
++++ b/python/mirage/engine/llm_engine.py
+@@ -177,6 +177,8 @@ class LLMEngine:
+ 
+         # Serialises ring-buffer writes so two callers do not interleave.
+         self._submit_lock = threading.RLock()
++        # Serialises yield/resume/close transitions, which may block on GPU work.
++        self._kernel_control_lock = threading.Lock()
+ 
+         # Shared streaming monitor — replaces per-request polling threads.
+         self._monitor: _StreamingMonitor
+@@ -184,6 +186,9 @@ class LLMEngine:
+         # Background kernel bookkeeping.
+         self._kernel_launched: threading.Event = threading.Event()
+         self._kernel_thread: threading.Thread | None = None
++        self._kernel_error: BaseException | None = None
++        self._yielded = False
++        self._yielding = False
+         self._closed = False
+ 
+         # Launch MPK kernels
+@@ -225,6 +230,9 @@ class LLMEngine:
+         with self._submit_lock:
+             if self._closed:
+                 raise RuntimeError("LLMEngine is closed")
++            if self._yielded or self._yielding:
++                raise RuntimeError("LLMEngine is yielded or currently draining")
++            self._raise_kernel_error()
+             rid = self._next_rid
+             self._next_rid += 1
+             if stream:
+@@ -254,8 +262,94 @@ class LLMEngine:
+             finally:
+                 self.runtime.release_request(rid)
+ 
++    def yield_kernel(self) -> None:
++        """Drain the MPK worker/scheduler loops and preserve active decode state.
++
++        The call blocks until the GPU is safe to hand off. In distributed mode,
++        invoke it on every MPI rank. Existing requests remain paused and can
++        continue after :meth:`resume`.
++        """
++        with self._kernel_control_lock:
++            with self._submit_lock:
++                if self._closed:
++                    raise RuntimeError("LLMEngine is closed")
++                if self._yielded or self._yielding:
++                    raise RuntimeError("LLMEngine is already yielded or draining")
++                self._yielding = True
++            try:
++                self._wait_for_kernel_launch()
++                self.model_runner.request_yield()
++                if self._kernel_thread is not None:
++                    self._kernel_thread.join()
++                self._raise_kernel_error()
++                if not self.model_runner.checkpoint_available:
++                    raise RuntimeError(
++                        "MPK stopped without a resumable checkpoint")
++                with self._submit_lock:
++                    self._yielded = True
++                    self._yielding = False
++            except BaseException:
++                with self._submit_lock:
++                    self._yielding = False
++                raise
++
++    def resume(self) -> None:
++        """Resume decoding from the in-memory MPK checkpoint."""
++        with self._kernel_control_lock:
++            with self._submit_lock:
++                if self._closed:
++                    raise RuntimeError("LLMEngine is closed")
++                if not self._yielded:
++                    raise RuntimeError("LLMEngine has no yielded checkpoint")
++                self._yielding = True
++            try:
++                self._start_kernel_thread(resume=True)
++                self._wait_for_kernel_launch()
++                with self._submit_lock:
++                    self._yielded = False
++                    self._yielding = False
++            except BaseException:
++                with self._submit_lock:
++                    self._yielding = False
++                raise
++
++    @property
++    def is_yielded(self) -> bool:
++        with self._submit_lock:
++            return self._yielded or self._yielding
++
+     # ── Internal ──────────────────────────────────────────────────────────
+ 
++    def _wait_for_kernel_launch(self) -> None:
++        while not self.model_runner.kernel_active:
++            thread = self._kernel_thread
++            if thread is None or not thread.is_alive():
++                self._raise_kernel_error()
++                raise RuntimeError("MPK kernel is not running")
++            time.sleep(0.001)
++
++    def _start_kernel_thread(self, resume: bool = False) -> None:
++        self._kernel_error = None
++        self._kernel_thread = threading.Thread(
++            target=self._run_kernel,
++            args=(resume,),
++            daemon=True,
++        )
++        self._kernel_thread.start()
++
++    def _run_kernel(self, resume: bool) -> None:
++        try:
++            if resume:
++                self.model_runner.resume()
++            else:
++                self.model_runner()
++        except BaseException as exc:
++            self._kernel_error = exc
++
++    def _raise_kernel_error(self) -> None:
++        if self._kernel_error is not None:
++            raise RuntimeError("MPK kernel thread failed") from self._kernel_error
++
+     def _ensure_kernel_running(self) -> None:
+         """Launch the persistent kernel once in a background daemon thread."""
+         if self._kernel_launched.is_set():
+@@ -265,9 +359,7 @@ class LLMEngine:
+                 return
+             self.runtime.reset()
+             self.runtime.start()
+-            self._kernel_thread = threading.Thread(
+-                target=self.model_runner, daemon=True)
+-            self._kernel_thread.start()
++            self._start_kernel_thread(resume=False)
+             self._kernel_launched.set()
+ 
+     def _submit_stream(
+@@ -304,20 +396,31 @@ class LLMEngine:
+ 
+     def close(self) -> None:
+         """Signal the GPU kernel to shut down at the next idle cycle."""
+-        with self._submit_lock:
+-            if self._closed:
+-                return
+-            self._closed = True
+-        monitor_error: Exception | None = None
+-        try:
+-            self._monitor.shutdown()
+-        except Exception as exc:
+-            monitor_error = exc
+-        try:
+-            self.runtime.request_shutdown()
+-            if self._kernel_thread is not None:
+-                self._kernel_thread.join()
+-        finally:
+-            self.runtime.stop()
+-        if monitor_error is not None:
+-            raise monitor_error
++        with self._kernel_control_lock:
++            with self._submit_lock:
++                if self._closed:
++                    return
++                self._closed = True
++                was_yielded = self._yielded
++                self._yielding = was_yielded
++            monitor_error: Exception | None = None
++            try:
++                self._monitor.shutdown()
++            except Exception as exc:
++                monitor_error = exc
++            try:
++                self.runtime.request_shutdown()
++                if was_yielded:
++                    # The shutdown flag is visible when the saved scheduler
++                    # reaches its next batch boundary after resuming.
++                    self._start_kernel_thread(resume=True)
++                    with self._submit_lock:
++                        self._yielded = False
++                        self._yielding = False
++                if self._kernel_thread is not None:
++                    self._kernel_thread.join()
++                self._raise_kernel_error()
++            finally:
++                self.runtime.stop()
++            if monitor_error is not None:
++                raise monitor_error
+diff --git a/python/mirage/engine/model_runner.py b/python/mirage/engine/model_runner.py
+index 7f8b9987..b56f39cb 100644
+--- a/python/mirage/engine/model_runner.py
++++ b/python/mirage/engine/model_runner.py
+@@ -4,6 +4,7 @@
+ from __future__ import annotations
+ 
+ import os
++import threading
+ from dataclasses import dataclass
+ from typing import Optional
+ 
+@@ -111,6 +112,7 @@ class ModelRunner:
+         self.runtime = OnlinePinnedRuntime(self.mpk)
+         self.tokenizer = self.mpk.tokenizer
+         self.mpk.compile(output_dir=config.output_dir)
++        self._kernel_active = threading.Event()
+ 
+     # ── Execution ─────────────────────────────────────────────────────────────
+ 
+@@ -121,10 +123,35 @@ class ModelRunner:
+         requests and poll completions through :attr:`runtime`.
+         """
+         self.mpk()
++        self._kernel_active.set()
+         # The split worker/scheduler launch is asynchronous. Keep this Python
+         # thread alive until both GPU streams exit so LLMEngine.close() can
+         # safely join it before stopping completion draining or freeing state.
+-        self.mpk.persistent_kernel.wait()
++        try:
++            self.mpk.persistent_kernel.wait()
++        finally:
++            self._kernel_active.clear()
++
++    def request_yield(self) -> None:
++        """Ask the running kernel to drain; its owner thread performs the wait."""
++        self.mpk.persistent_kernel.request_revocation()
++
++    def resume(self) -> None:
++        """Resume the preserved kernel and wait for its next stop request."""
++        self.mpk.persistent_kernel.resume()
++        self._kernel_active.set()
++        try:
++            self.mpk.persistent_kernel.wait()
++        finally:
++            self._kernel_active.clear()
++
++    @property
++    def kernel_active(self) -> bool:
++        return self._kernel_active.is_set()
++
++    @property
++    def checkpoint_available(self) -> bool:
++        return self.mpk.persistent_kernel.checkpoint_available
+ 
+     # ── Private helpers ───────────────────────────────────────────────────────
+ 
+diff --git a/python/mirage/mpk/persistent_kernel.py b/python/mirage/mpk/persistent_kernel.py
+index 3fad5e71..944f0e1f 100644
+--- a/python/mirage/mpk/persistent_kernel.py
++++ b/python/mirage/mpk/persistent_kernel.py
+@@ -138,11 +138,47 @@ static PyObject *launch_func(PyObject *self, PyObject *args) {
+     return NULL;
+   }
+   stream = (cudaStream_t)PyLong_AsVoidPtr(py_stream);
+-  launch_persistent_kernel(stream);
++  cudaError_t err = launch_persistent_kernel(stream);
++  if (err != cudaSuccess) {
++    PyErr_Format(PyExc_RuntimeError,
++                 "persistent kernel launch failed: %s",
++                 cudaGetErrorString(err));
++    return NULL;
++  }
++
++  Py_RETURN_NONE;
++}
++
++static PyObject *resume_func(PyObject *self, PyObject *args) {
++  PyObject *py_stream;
++  if (!PyArg_ParseTuple(args, "O", &py_stream)) {
++    PyErr_SetString(PyExc_TypeError, "Invalid parameters");
++    return NULL;
++  }
++  cudaStream_t stream = (cudaStream_t)PyLong_AsVoidPtr(py_stream);
++  if (PyErr_Occurred()) return NULL;
++  cudaError_t err = resume_persistent_kernel(stream);
++  if (err != cudaSuccess) {
++    PyErr_Format(PyExc_RuntimeError,
++                 "persistent kernel resume failed: %s",
++                 cudaGetErrorString(err));
++    return NULL;
++  }
+ 
+   Py_RETURN_NONE;
+ }
+ 
++static PyObject *request_revocation_func(PyObject *self, PyObject *args) {
++  cudaError_t err = request_persistent_kernel_revocation();
++  if (err != cudaSuccess) {
++    PyErr_Format(PyExc_RuntimeError,
++                 "revocation request failed: %s",
++                 cudaGetErrorString(err));
++    return NULL;
++  }
++  Py_RETURN_NONE;
++}
++
+ static PyObject *wait_func(PyObject *self, PyObject *args) {
+   cudaError_t err;
+   Py_BEGIN_ALLOW_THREADS
+@@ -157,6 +193,10 @@ static PyObject *wait_func(PyObject *self, PyObject *args) {
+   Py_RETURN_NONE;
+ }
+ 
++static PyObject *checkpoint_available_func(PyObject *self, PyObject *args) {
++  return PyBool_FromLong(persistent_kernel_checkpoint_available() ? 1 : 0);
++}
++
+ static PyObject *finalize_func(PyObject *self, PyObject *args) {
+   finalize_persistent_kernel();
+ 
+@@ -196,7 +236,10 @@ static PyMethodDef ModuleMethods[] = {
+   {"init_func", init_func, METH_VARARGS, "initialize persistent kernel"},
+   {"init_request_func", init_request_func, METH_VARARGS, "initialize request resources"},
+   {"launch_func", launch_func, METH_VARARGS, "launch persistent kernel"},
++  {"resume_func", resume_func, METH_VARARGS, "resume persistent kernel"},
++  {"request_revocation_func", request_revocation_func, METH_NOARGS, "request persistent kernel revocation"},
+   {"wait_func", wait_func, METH_NOARGS, "wait for persistent kernel"},
++  {"checkpoint_available_func", checkpoint_available_func, METH_NOARGS, "check for a resumable checkpoint"},
+   {"finalize_func", finalize_func, METH_VARARGS, "finalize persistent kernel"},
+   {"load_i32_acquire", load_i32_acquire, METH_VARARGS, "acquire-load int32"},
+   {"store_i32_release", store_i32_release, METH_VARARGS, "release-store int32"},
+@@ -444,6 +487,9 @@ class PersistentKernel:
+     ):
+         self.__finalized__ = False
+         self._is_compiled = False
++        self._kernel_running = False
++        self._revocation_requested = False
++        self._checkpoint_ready = False
+         self.test_mode = test_mode
+         self.do_sample = do_sample
+         self.temperature = temperature
+@@ -3374,7 +3420,10 @@ class PersistentKernel:
+         spec.loader.exec_module(mod)
+         self.init_func = getattr(mod, "init_func")
+         self.launch_func = getattr(mod, "launch_func")
++        self.resume_func = getattr(mod, "resume_func")
+         self.wait_func = getattr(mod, "wait_func")
++        self.checkpoint_available_func = getattr(mod, "checkpoint_available_func")
++        self.request_revocation_func = getattr(mod, "request_revocation_func")
+         self.finalize_func = getattr(mod, "finalize_func")
+         self.load_i32_acquire = getattr(mod, "load_i32_acquire")
+         self.store_i32_release = getattr(mod, "store_i32_release")
+@@ -3507,8 +3556,11 @@ class PersistentKernel:
+         spec.loader.exec_module(mod)
+         self.init_func = getattr(mod, "init_func")
+         self.launch_func = getattr(mod, "launch_func")
++        self.resume_func = getattr(mod, "resume_func")
+         self.init_request_func = getattr(mod, "init_request_func")
+         self.wait_func = getattr(mod, "wait_func")
++        self.checkpoint_available_func = getattr(mod, "checkpoint_available_func")
++        self.request_revocation_func = getattr(mod, "request_revocation_func")
+         self.finalize_func = getattr(mod, "finalize_func")
+         self.load_i32_acquire = getattr(mod, "load_i32_acquire")
+         self.store_i32_release = getattr(mod, "store_i32_release")
+@@ -3576,6 +3628,10 @@ class PersistentKernel:
+         self._is_compiled = True
+ 
+     def __call__(self, **kwargs):
++        if self._kernel_running:
++            raise RuntimeError("persistent kernel is already running")
++        if self._checkpoint_ready:
++            raise RuntimeError("checkpoint is available; call resume() to continue")
+         stream = kwargs.get("default_stream", None)
+         if stream is None:
+            stream = torch.cuda.current_stream()
+@@ -3594,6 +3650,7 @@ class PersistentKernel:
+         else:
+             raise ValueError("Invalid stream object")
+         self.launch_func(stream_ptr)
++        self._kernel_running = True
+         if self.profiler_tensor is not None:
+             from .profiler_persistent import export_to_csv, export_to_perfetto_trace
+ 
+@@ -3611,12 +3668,74 @@ class PersistentKernel:
+         if not self.__finalized__:
+             self.finalize()
+ 
++    def request_revocation(self) -> None:
++        """Request a coordinated in-memory checkpoint.
++
++        In distributed mode, call this method on every MPI rank. Call wait()
++        before resume(); checkpoints live in GPU memory for this object/process.
++        """
++        if not self._kernel_running:
++            raise RuntimeError("persistent kernel is not running")
++        was_requested = self._revocation_requested
++        self._revocation_requested = True
++        try:
++            self.request_revocation_func()
++        except Exception:
++            self._revocation_requested = was_requested
++            raise
++
++    def yield_kernel(self) -> None:
++        """Drain the persistent kernel and save a resumable in-memory checkpoint."""
++        self.request_revocation()
++        self.wait()
++        if not self._checkpoint_ready:
++            raise RuntimeError("persistent kernel stopped without a resumable checkpoint")
++
+     def wait(self) -> None:
+-        """Block until both persistent GPU streams have exited."""
++        """Wait until the kernel has drained after revocation or completed normally."""
++        requested = self._revocation_requested
+         self.wait_func()
++        self._kernel_running = False
++        self._checkpoint_ready = bool(self.checkpoint_available_func())
++        self._revocation_requested = False
++        if requested and not self._checkpoint_ready:
++            raise RuntimeError(
++                "kernel stopped without a resumable checkpoint; it may have terminated before revocation completed"
++            )
++
++    @property
++    def checkpoint_available(self) -> bool:
++        """Whether the last wait produced a resumable in-memory checkpoint."""
++        return self._checkpoint_ready
++
++    def resume(self, **kwargs) -> None:
++        """Resume a drained kernel from its in-memory queues and checkpoints.
++
++        In distributed mode, call resume() on every MPI rank.
++        """
++        if not self._checkpoint_ready:
++            raise RuntimeError("no revoked kernel checkpoint is available")
++        stream = kwargs.get("default_stream", None)
++        if stream is None:
++            stream = torch.cuda.current_stream()
++        if hasattr(stream, "cuda_stream"):
++            try:
++                stream_ptr = int(stream.cuda_stream)
++            except Exception:
++                stream_ptr = int(stream.cuda_stream.value)
++        elif isinstance(stream, int):
++            stream_ptr = stream
++        else:
++            raise ValueError(f"Invalid stream object: {stream} is of type {type(stream)}")
++        self.resume_func(stream_ptr)
++        self._kernel_running = True
++        self._checkpoint_ready = False
+ 
+     def finalize(self):
+         assert not self.__finalized__
++        if self._kernel_running:
++            self.request_revocation()
++            self.wait()
+         if self._is_compiled:
+             self.finalize_func()
+         self.__finalized__ = True
+diff --git a/tests/python/test_llm_engine_yield.py b/tests/python/test_llm_engine_yield.py
+new file mode 100644
+index 00000000..a1dd230f
+--- /dev/null
++++ b/tests/python/test_llm_engine_yield.py
+@@ -0,0 +1,140 @@
++"""CPU-only tests for the LLMEngine yield/resume control flow."""
++
++from __future__ import annotations
++
++import importlib.util
++import pathlib
++import sys
++import threading
++import types
++import unittest
++
++
++ROOT = pathlib.Path(__file__).resolve().parents[2]
++ENGINE_PATH = ROOT / "python" / "mirage" / "engine" / "llm_engine.py"
++
++
++def _load_llm_engine():
++    """Load LLMEngine with lightweight package stubs, without CUDA imports."""
++    names = (
++        "mirage",
++        "mirage.engine",
++        "mirage.engine.model_runner",
++        "mirage.engine.tokenizer_manager",
++        "mirage.mpk",
++        "mirage.mpk.online_pinned_runtime",
++        "mirage.engine.llm_engine",
++    )
++    previous = {name: sys.modules.get(name) for name in names}
++
++    mirage = types.ModuleType("mirage")
++    mirage.__path__ = []
++    engine = types.ModuleType("mirage.engine")
++    engine.__path__ = []
++    mpk = types.ModuleType("mirage.mpk")
++    mpk.__path__ = []
++    model_runner = types.ModuleType("mirage.engine.model_runner")
++    tokenizer_manager = types.ModuleType("mirage.engine.tokenizer_manager")
++    runtime = types.ModuleType("mirage.mpk.online_pinned_runtime")
++
++    class ModelRunner:
++        pass
++
++    class TokenizerManager:
++        pass
++
++    class OnlinePinnedRuntime:
++        pass
++
++    model_runner.ModelRunner = ModelRunner
++    tokenizer_manager.TokenizerManager = TokenizerManager
++    runtime.OnlinePinnedRuntime = OnlinePinnedRuntime
++    sys.modules.update({
++        "mirage": mirage,
++        "mirage.engine": engine,
++        "mirage.engine.model_runner": model_runner,
++        "mirage.engine.tokenizer_manager": tokenizer_manager,
++        "mirage.mpk": mpk,
++        "mirage.mpk.online_pinned_runtime": runtime,
++    })
++
++    spec = importlib.util.spec_from_file_location(
++        "mirage.engine.llm_engine", ENGINE_PATH)
++    assert spec is not None and spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[spec.name] = module
++    try:
++        spec.loader.exec_module(module)
++    finally:
++        for name, value in previous.items():
++            if value is None:
++                sys.modules.pop(name, None)
++            else:
++                sys.modules[name] = value
++    return module.LLMEngine
++
++
++LLMEngine = _load_llm_engine()
++
++
++class FakeRunner:
++    def __init__(self, checkpoint_available: bool = True) -> None:
++        self.kernel_active = threading.Event()
++        self.kernel_active.set()
++        self.checkpoint_available = checkpoint_available
++        self.yield_requests = 0
++        self.resumes = 0
++
++    def request_yield(self) -> None:
++        self.yield_requests += 1
++        self.kernel_active.clear()
++
++    def resume(self) -> None:
++        self.resumes += 1
++        self.kernel_active.set()
++
++
++def _engine(runner: FakeRunner):
++    engine = LLMEngine.__new__(LLMEngine)
++    engine.model_runner = runner
++    engine._submit_lock = threading.RLock()
++    engine._kernel_control_lock = threading.Lock()
++    engine._kernel_launched = threading.Event()
++    engine._kernel_launched.set()
++    engine._kernel_thread = None
++    engine._kernel_error = None
++    engine._yielded = False
++    engine._yielding = False
++    engine._closed = False
++    engine.tokenizer_manager = types.SimpleNamespace(
++        tokenize=lambda prompt, use_template: [1])
++    engine._next_rid = 0
++    return engine
++
++
++class LLMEngineYieldTests(unittest.TestCase):
++    def test_yield_blocks_submits_and_resume_restarts_kernel(self) -> None:
++        runner = FakeRunner()
++        engine = _engine(runner)
++
++        engine.yield_kernel()
++        self.assertTrue(engine.is_yielded)
++        self.assertEqual(runner.yield_requests, 1)
++        with self.assertRaisesRegex(RuntimeError, "yielded"):
++            engine.submit("prompt")
++
++        engine.resume()
++        engine._kernel_thread.join(timeout=2)
++        self.assertFalse(engine.is_yielded)
++        self.assertEqual(runner.resumes, 1)
++        self.assertTrue(runner.kernel_active.is_set())
++
++    def test_yield_rejects_missing_checkpoint(self) -> None:
++        engine = _engine(FakeRunner(checkpoint_available=False))
++        with self.assertRaisesRegex(RuntimeError, "without a resumable checkpoint"):
++            engine.yield_kernel()
++        self.assertFalse(engine.is_yielded)
++
++
++if __name__ == "__main__":
++    unittest.main()

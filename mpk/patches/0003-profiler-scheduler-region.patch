@@ -1,0 +1,35 @@
+diff --git a/include/mirage/persistent_kernel/persistent_kernel.cuh b/include/mirage/persistent_kernel/persistent_kernel.cuh
+index 873e064b..feabf983 100644
+--- a/include/mirage/persistent_kernel/persistent_kernel.cuh
++++ b/include/mirage/persistent_kernel/persistent_kernel.cuh
+@@ -279,6 +279,12 @@ __device__ __forceinline__ int
+   return first_live_token / block_size;
+ }
+ 
++// Entry offset of the scheduler kernel's profiler region (worker_kernel
++// uses [0, offset)). Matches half of the demo's 3000*128-entry buffer.
++#ifndef MPK_PROFILER_SCHED_OFFSET
++#define MPK_PROFILER_SCHED_OFFSET 192000
++#endif
++
+ #ifdef MODE_OFFLINE
+ // TODO: parallelize this processing
+ __device__ __forceinline__ bool
+@@ -1284,8 +1290,15 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
+     // Up to 4 scheduler warps share one block but the profiler has one
+     // slot per block (num_groups=1).  Only warp 0 writes so events from
+     // different warps don't interleave.
+-    PROFILER_INIT(
+-        static_cast<uint64_t *>(config.profiler_buffer), 0, 1, (warp_id == 0));
++    // The scheduler kernel runs alongside worker_kernel and would otherwise
++    // share the profiler buffer's header and slot layout with it (header
++    // overwritten, events interleaved). Give it its own region.
++    // Parenthesized: PROFILER_INIT does not parenthesize its buffer argument.
++    PROFILER_INIT((static_cast<uint64_t *>(config.profiler_buffer) +
++                   MPK_PROFILER_SCHED_OFFSET),
++                  0,
++                  1,
++                  (warp_id == 0));
+     uint32_t sched_profiling_cnt = 0;
+ #endif
+ 

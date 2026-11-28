@@ -1,0 +1,92 @@
+diff --git a/include/mirage/persistent_kernel/persistent_kernel.cuh b/include/mirage/persistent_kernel/persistent_kernel.cuh
+index f65e2b99..d6edc752 100644
+--- a/include/mirage/persistent_kernel/persistent_kernel.cuh
++++ b/include/mirage/persistent_kernel/persistent_kernel.cuh
+@@ -40,6 +40,7 @@
+ #endif
+ #endif
+ #include <map>
++#include <cstdlib>
+ #include <mutex>
+ #include <thread>
+ #include <unistd.h>
+@@ -1180,8 +1181,16 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
+       queue_len = num_loaded_tasks;
+     }
+     TaskDesc *task_desc = task_descs + queue_pos;
++    // Task-boundary yield: stop before this task (it has not run) when a
++    // revocation is requested, including while waiting on its dependency.
++    bool const yield_at_task = config.yield_mode == 1;
++    if (threadIdx.x == 0 && yield_at_task &&
++        get_revocation_state(config) >=
++            static_cast<int>(RevocationState::REVOKE_REQUESTED)) {
++      should_exit_worker = 1;
++    }
+     // Make sure task is ready before start execution
+-    if (threadIdx.x == 0) {
++    if (threadIdx.x == 0 && !should_exit_worker) {
+       if (task_desc->dependent_event != EVENT_INVALID_ID) {
+         // Wait until the event has been triggered enough times
+         EventId event_id = task_desc->dependent_event;
+@@ -1204,12 +1213,35 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
+           while (actual_counts < needed_counts) {
+             actual_counts =
+                 ld_acquire_sys_u64(&config.all_event_counters[event_index]);
++            if (actual_counts < needed_counts && yield_at_task &&
++                get_revocation_state(config) >=
++                    static_cast<int>(RevocationState::REVOKE_REQUESTED)) {
++              should_exit_worker = 1;
++              break;
++            }
+             __nanosleep(10);
+           }
+         }
+       }
+     }
+     __syncthreads();
++    if (should_exit_worker) {
++      if (threadIdx.x == 0) {
++        if (config.worker_checkpoints != nullptr) {
++          WorkerCheckpoint *checkpoint = &config.worker_checkpoints[worker_id];
++          checkpoint->consumed_task_pos[active_queue_idx] =
++              batch_start_pos + static_cast<unsigned long long>(queue_pos);
++          checkpoint->active_queue_idx = active_queue_idx;
++          __threadfence();
++          checkpoint->acknowledged = 1;
++        }
++        if (config.worker_states != nullptr) {
++          atomicExch(&config.worker_states[worker_id],
++                     static_cast<int>(ParticipantState::STOPPED));
++        }
++      }
++      return;
++    }
+ 
+ #ifdef MPK_ENABLE_PROFILING
+     if (task_desc->task_type != TASK_TERMINATE) {
+@@ -2088,6 +2120,13 @@ extern "C" void
+   // Each worker now maintains a local and a remote worker queue
+   // Allocate persistent revocation control state.
+   global_runtime_config.resume_mode = 0;
++  {
++    char const *mode = std::getenv("MPK_YIELD_MODE");
++    global_runtime_config.yield_mode =
++        (mode != nullptr && std::string(mode) == "drain") ? 0 : 1;
++    printf("MPK yield mode: %s\n",
++           global_runtime_config.yield_mode ? "task-boundary" : "drain");
++  }
+   global_runtime_config.revocation_control =
+       gpu_malloc<RevocationControl>(sizeof(RevocationControl));
+   global_runtime_config.scheduler_checkpoints =
+diff --git a/include/mirage/persistent_kernel/runtime_header.h b/include/mirage/persistent_kernel/runtime_header.h
+index 8fffe45d..d2fee621 100644
+--- a/include/mirage/persistent_kernel/runtime_header.h
++++ b/include/mirage/persistent_kernel/runtime_header.h
+@@ -453,6 +453,7 @@ struct RuntimeConfig {
+   int *scheduler_states;
+   unsigned long long *scheduler_worker_queue_cursors;
+   int resume_mode;
++  int yield_mode; // 1 = stop workers at the next task boundary, 0 = drain queues
+ 
+   int num_workers, num_local_schedulers, num_remote_schedulers, num_graphs;
+   int num_gpus, my_gpu_id;

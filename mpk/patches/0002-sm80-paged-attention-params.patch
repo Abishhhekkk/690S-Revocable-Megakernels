@@ -1,0 +1,24 @@
+diff --git a/python/mirage/mpk/persistent_kernel.py b/python/mirage/mpk/persistent_kernel.py
+index 3fad5e71..43dca21f 100644
+--- a/python/mirage/mpk/persistent_kernel.py
++++ b/python/mirage/mpk/persistent_kernel.py
+@@ -1396,6 +1396,19 @@ class PersistentKernel:
+                 break
+         params = [num_q_heads, num_kv_heads, qk_norm, rotary_embed,
+                   self.max_seq_length, block_size] + tail[:n]
++        if self.target_cc == 80:
++            # The sm80 parser (TaskRegister::register_paged_attention_task)
++            # takes a FIXED 10-param form: [..., q_len_override, tail_offset,
++            # group_id, page_stride_rows]. Sending the tail form above made it
++            # read the qk-norm eps bits (params[9] = 0x358637BD = 1e-6f) as
++            # page_stride_rows, so any request on page > 0 (batch > 1)
++            # addressed far outside the KV cache (cudaErrorIllegalAddress).
++            assert rotary_dim == 0 and window_size == 0 and not has_sink, (
++                "sm80 paged attention does not support partial RoPE, "
++                "sliding windows or sinks")
++            params = [num_q_heads, num_kv_heads, qk_norm, rotary_embed,
++                      self.max_seq_length, block_size,
++                      q_len_override, tail_offset, group_id, stride_field]
+         if self.target_cc == 100:
+             # params[14]: max_tokens_per_request (rows the CTA buffers hold).
+             params = [num_q_heads, num_kv_heads, qk_norm, rotary_embed,
