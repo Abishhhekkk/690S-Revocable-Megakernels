@@ -1,0 +1,20 @@
+{
+  "_comment": "C4 step-1: steady large-batch background decode (8 requests at t=0, long outputs) plus random urgent arrivals.",
+  "seed": 0,
+  "duration_s": 30,
+  "max_seq_len": 512,
+  "classes": {
+    "background": {
+      "priority": 1, "deadline_ms": null,
+      "arrival": {"type": "batch", "count": 8, "at_s": 0.0},
+      "prompt_len": {"dist": "fixed", "value": 32},
+      "output_len": {"dist": "fixed", "value": 480}
+    },
+    "urgent": {
+      "priority": 0, "deadline_ms": 50,
+      "arrival": {"type": "random", "count": 20, "min_gap_s": 0.5},
+      "prompt_len": {"dist": "uniform", "lo": 16, "hi": 64},
+      "output_len": {"dist": "fixed", "value": 16}
+    }
+  }
+}

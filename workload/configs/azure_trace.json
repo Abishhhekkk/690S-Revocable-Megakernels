@@ -1,0 +1,19 @@
+{
+  "_comment": "Background arrivals and lengths replayed from the Azure LLM inference trace (download separately, see workload/README.md); random urgent arrivals on top.",
+  "seed": 0,
+  "duration_s": 60,
+  "max_seq_len": 4096,
+  "classes": {
+    "background": {
+      "priority": 1, "deadline_ms": null,
+      "arrival": {"type": "trace", "path": "workload/traces/AzureLLMInferenceTrace_conv.csv",
+                  "speedup": 1.0, "offset_s": 0}
+    },
+    "urgent": {
+      "priority": 0, "deadline_ms": 50,
+      "arrival": {"type": "random", "count": 30},
+      "prompt_len": {"dist": "uniform", "lo": 16, "hi": 64},
+      "output_len": {"dist": "fixed", "value": 16}
+    }
+  }
+}

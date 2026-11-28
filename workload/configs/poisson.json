@@ -1,0 +1,19 @@
+{
+  "seed": 0,
+  "duration_s": 60,
+  "max_seq_len": 512,
+  "classes": {
+    "background": {
+      "priority": 1, "deadline_ms": null,
+      "arrival": {"type": "poisson", "rate": 2.0},
+      "prompt_len": {"dist": "lognormal", "median": 128, "sigma": 0.7, "lo": 16, "hi": 384},
+      "output_len": {"dist": "uniform", "lo": 64, "hi": 256}
+    },
+    "urgent": {
+      "priority": 0, "deadline_ms": 50,
+      "arrival": {"type": "poisson", "rate": 0.5},
+      "prompt_len": {"dist": "uniform", "lo": 16, "hi": 64},
+      "output_len": {"dist": "fixed", "value": 16}
+    }
+  }
+}
